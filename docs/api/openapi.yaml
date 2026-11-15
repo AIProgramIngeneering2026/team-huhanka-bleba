@@ -47,9 +47,10 @@ info:
     * `operator` — видит все отчёты и Job, отменяет и запускает Job, не правит чужие отчёты;
     * `reader` — внешняя система или получатель: читает список и файлы отчётов, к которым выдан доступ.
 
-    Отчёт или Job, к которым у пользователя нет доступа, неотличимы от несуществующих — `404 not_found`.
-    Для файлов действует требование SC-4: нет права чтения отчёта — `403 forbidden`, одинаково
-    для существующего и несуществующего файла.
+    Одно правило для отчётов, Job и файлов: ресурс, к которому у пользователя нет доступа, неотличим
+    от несуществующего — `404 not_found` с одинаковым телом. Так клиент не узнаёт, существует ли
+    чужой ресурс (SC-4). `403 forbidden` — только когда ресурс доступен, но роль не позволяет действие
+    (например, `reader` пытается создать отчёт или отменить Job).
 servers:
   - url: http://localhost:8080/api/v1
     description: docker compose
@@ -478,7 +479,7 @@ paths:
       tags: [files]
       operationId: listReportFiles
       summary: Список файлов отчёта за период (SC-4)
-      description: Нет права чтения отчёта или отчёта нет — `403 forbidden`.
+      description: Нет права чтения отчёта или отчёта нет — `404 not_found`.
       parameters:
         - name: from
           in: query
@@ -505,8 +506,8 @@ paths:
           $ref: '#/components/responses/ValidationFailed'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -525,8 +526,8 @@ paths:
       description: |
         `mode=stream` — файл потоком; `mode=url` — presigned URL MinIO со сроком не больше настроенного (по умолчанию 15 минут).
 
-        * Нет права чтения отчёта — `403 forbidden`, существует ли файл, не раскрывается.
-        * Право есть, файла нет — `404 not_found`.
+        * Нет права чтения отчёта, нет отчёта или нет файла — `404 not_found` с одинаковым телом:
+          существует ли файл, не раскрывается.
         * Файл удалён из MinIO lifecycle-политикой — `410 file_gone`, запись в `report_files` помечается удалённой.
       parameters:
         - name: mode
@@ -550,8 +551,6 @@ paths:
           $ref: '#/components/responses/ValidationFailed'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '410':
@@ -642,7 +641,9 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
     Forbidden:
-      description: Роль пользователя не позволяет действие. Код `forbidden`.
+      description: |
+        Ресурс доступен пользователю, но роль не позволяет действие. Код `forbidden`.
+        Если ресурс недоступен вовсе — `404 not_found`, а не `403`.
       content:
         application/json:
           schema:
