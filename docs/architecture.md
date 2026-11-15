@@ -46,3 +46,124 @@ flowchart LR
 | Grafana | Источник данных: описание дашборда и данные панелей; сервис ходит от сервисного аккаунта |
 | MinIO | Хранилище PDF; живёт по своей lifecycle-политике, может удалить старые файлы |
 | SMTP-сервер | Канал доставки писем; может отказать или принять письмо с задержкой |
+
+## Схема компонентов
+
+Один репозиторий, два процесса: **Api** (ASP.NET Core) и **Worker** (Hangfire-сервер). Оба используют одно
+доменное ядро и одну базу PostgreSQL. Планировщик и очередь — Hangfire с хранилищем в той же PostgreSQL.
+
+```mermaid
+flowchart TB
+    client(["Клиент API<br/>владелец, оператор, внешняя система"])
+
+    subgraph api["Процесс Api"]
+        http["<b>HTTP API</b><br/>контроллеры, аутентификация,<br/>валидация DTO, формат ошибок"]
+        jobsvc["<b>JobService</b><br/>создание, отмена, одобрение Job"]
+        reportsvc["<b>ReportService</b><br/>настройка отчётов и расписаний"]
+        filesvc["<b>FileService</b><br/>список и выгрузка файлов"]
+    end
+
+    subgraph worker["Процесс Worker"]
+        scheduler["<b>Scheduler</b><br/>RecurringJob по cron отчёта"]
+        dispatcher["<b>Dispatcher</b><br/>ведёт Job по шагам"]
+        registry["<b>ToolRegistry</b><br/>имя шага → Tool"]
+        subgraph tools["Tools"]
+            tcollect["grafana.collect"]
+            taggr["report.aggregate"]
+            trender["report.render"]
+            tminio["delivery.minio"]
+            temail["delivery.email"]
+        end
+    end
+
+    subgraph core["Доменное ядро (общая библиотека)"]
+        job["<b>Job</b><br/>состояние и правила переходов"]
+    end
+
+    queue[("<b>Очередь Hangfire</b><br/>PostgreSQL")]
+    storage[("<b>Хранение</b><br/>JobRepository, ReportRepository,<br/>ArtifactStore — PostgreSQL")]
+
+    gclient["<b>GrafanaClient</b><br/>адаптер Grafana HTTP API"]
+    ostorage["<b>ObjectStorage</b><br/>адаптер MinIO"]
+    mailer["<b>MailSender</b><br/>адаптер SMTP (MailKit)"]
+
+    grafana[/"Grafana"/]
+    minio[/"MinIO"/]
+    smtp[/"SMTP"/]
+
+    client -- "HTTPS, JSON" --> http
+    http --> reportsvc
+    http --> jobsvc
+    http --> filesvc
+
+    reportsvc -- "проверить дашборд и панели" --> gclient
+    reportsvc -- "сохранить отчёт" --> storage
+    reportsvc -- "создать / обновить расписание" --> scheduler
+
+    jobsvc -- "переход состояния" --> job
+    jobsvc -- "сохранить Job и событие" --> storage
+    jobsvc -. "поставить шаг в очередь" .-> queue
+
+    filesvc -- "метаданные файлов" --> storage
+    filesvc -- "поток / presigned URL" --> ostorage
+
+    scheduler -- "создать Job за период" --> jobsvc
+
+    queue -. "выдать шаг воркеру" .-> dispatcher
+    dispatcher -- "загрузить / сохранить Job,<br/>артефакты шагов" --> storage
+    dispatcher -- "переход состояния" --> job
+    dispatcher -- "Tool по имени шага" --> registry
+    dispatcher -- "ExecuteAsync(request)" --> tools
+    dispatcher -. "следующий шаг / повтор с backoff" .-> queue
+
+    tcollect --> gclient
+    tminio --> ostorage
+    temail --> mailer
+
+    gclient -- "HTTP" --> grafana
+    ostorage -- "S3 API" --> minio
+    mailer -- "SMTP" --> smtp
+```
+
+**Что показывают стрелки.** Сплошная стрелка — **синхронный вызов** во время работы: от вызывающего к вызываемому,
+подпись — зачем вызывает. Пунктир — **асинхронная передача через очередь**: отправитель не ждёт выполнения.
+Зависимости кода (кто чей тип импортирует) на этой схеме не показаны — они ниже, отдельной схемой.
+
+### Ответственность компонентов
+
+| Компонент | За что отвечает | Что скрывает от соседей |
+|---|---|---|
+| **HTTP API** | Принимает запросы, проверяет аутентификацию и роль, валидирует DTO по контракту, превращает исключения в единый формат ошибок | HTTP: маршруты, коды ответов, JSON-сериализацию, заголовки `Idempotency-Key` и `Authorization` |
+| **ReportService** | Создаёт и правит отчёты: проверяет дашборд и панели в Grafana, сохраняет настройку, обновляет расписание | Порядок проверок при сохранении и то, что расписание живёт в Hangfire |
+| **JobService** | Создаёт Job (с проверкой дубля на «отчёт + период» и идемпотентности), отменяет, одобряет, отклоняет | Как ищется дубль, как хранятся ключи идемпотентности, что шаг ставится в очередь |
+| **FileService** | Отдаёт список файлов и сам файл или presigned URL, проверяет право чтения | Где физически лежит файл и как формируется ссылка; существует ли файл, если прав нет |
+| **Scheduler** | По cron и часовому поясу отчёта вычисляет границы периода и просит JobService создать Job | Cron-выражения, часовые пояса, переход на летнее время, пропущенные запуски |
+| **Dispatcher** | Берёт Job, выбирает Tool для текущего шага, вызывает его, превращает результат или ошибку в переход Job, решает о повторе | Порядок шагов, политику ретраев и backoff, где лежат промежуточные результаты |
+| **ToolRegistry** | По имени шага выдаёт Tool; неизвестное имя — ошибка `unknown_operation` | Список конкретных Tool и как они создаются (DI) |
+| **Tool** | Выполняет один шаг: собрать данные, посчитать итоги, собрать PDF, доставить в канал. Контракт — [tool-contract.md](tool-contract.md) | Как именно сделан шаг: запросы к Grafana, библиотеку графиков и PDF, формат письма |
+| **Job** | Хранит состояние, проверяет, что переход разрешён, записывает событие перехода | Таблицу разрешённых переходов (см. диаграмму состояний ниже) |
+| **Хранение** | Сохраняет отчёты, Job, `job_events`, `report_files` и артефакты шагов; переход Job — условный `UPDATE` с версией | SQL, EF Core, схему таблиц, оптимистичную блокировку |
+| **Очередь Hangfire** | Доставляет шаги воркеру «хотя бы один раз», держит отложенные повторы | Хранилище и механизм невидимости задач |
+| **GrafanaClient** | Читает описание дашборда и данные панелей, подставляет переменные и период | Grafana HTTP API: URL, токен сервисного аккаунта, формат фреймов, таймауты |
+| **ObjectStorage** | Кладёт файл, читает его, выдаёт presigned URL | S3 API, бакеты, ключи объектов, учётные данные MinIO |
+| **MailSender** | Отправляет письмо с вложением списку адресатов | SMTP, MailKit, TLS, учётные данные почты |
+
+### Зависимости кода
+
+```mermaid
+flowchart LR
+    apiproj["Api<br/>(ASP.NET Core)"] --> app["Application<br/>JobService, ReportService,<br/>FileService"]
+    workerproj["Worker<br/>(Hangfire)"] --> app
+    workerproj --> engine["Engine<br/>Dispatcher, ToolRegistry, Tools"]
+    app --> domain["Domain<br/>Job, ITool, порты:<br/>IJobRepository, IGrafanaClient,<br/>IObjectStorage, IMailSender"]
+    engine --> domain
+    infra["Infrastructure<br/>EF Core, GrafanaClient,<br/>MinIO, MailKit"] --> domain
+    apiproj --> infra
+    workerproj --> infra
+```
+
+**Что показывают стрелки.** Здесь стрелка — **зависимость кода**: проект слева ссылается на проект справа и
+использует его типы. Все стрелки сходятся к `Domain`: ядро не знает ни ASP.NET, ни EF Core, ни Hangfire.
+Адаптеры из `Infrastructure` реализуют интерфейсы (порты), объявленные в `Domain`, и подключаются через DI
+только в `Api` и `Worker`. Поэтому направление вызовов (Dispatcher → GrafanaClient) и направление зависимости
+кода (GrafanaClient → интерфейс в Domain) противоположны.
