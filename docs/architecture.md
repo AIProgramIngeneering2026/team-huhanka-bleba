@@ -167,3 +167,85 @@ flowchart LR
 Адаптеры из `Infrastructure` реализуют интерфейсы (порты), объявленные в `Domain`, и подключаются через DI
 только в `Api` и `Worker`. Поэтому направление вызовов (Dispatcher → GrafanaClient) и направление зависимости
 кода (GrafanaClient → интерфейс в Domain) противоположны.
+
+## Диаграмма состояний Job
+
+Источник правды — таблица переходов в [requirements.md](requirements.md#жизненный-цикл-job); здесь она же в виде
+схемы и с запрещёнными переходами. Правило живёт в `Job`: вызывающий код (Dispatcher, JobService) только
+просит перейти, а `Job` разрешает или отклоняет.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Scheduled: создан по расписанию или вручную
+
+    Scheduled --> Collecting: воркер взял Job
+    Scheduled --> Cancelled: отмена
+
+    Collecting --> Aggregating: данные получены
+    Collecting --> Retrying: 5xx / таймаут Grafana
+    Collecting --> Failed: 401 / 403 / 404 Grafana
+    Collecting --> Cancelled: отмена
+
+    Aggregating --> Narrating: LLM включён
+    Aggregating --> Rendering: LLM выключен
+    Aggregating --> Failed: ошибка расчёта
+
+    Narrating --> Rendering: текст готов или шаг упал
+    Narrating --> Cancelled: отмена
+
+    Rendering --> AwaitingApproval: одобрение включено
+    Rendering --> Delivering: одобрение выключено
+    Rendering --> Retrying: временная ошибка
+    Rendering --> Failed: неустранимая ошибка
+
+    AwaitingApproval --> Delivering: одобрено
+    AwaitingApproval --> Cancelled: отклонено / истёк срок
+
+    Delivering --> Delivered: все каналы
+    Delivering --> PartiallyDelivered: не все каналы, попытки исчерпаны
+    Delivering --> Retrying: временная ошибка канала
+    Delivering --> Failed: ни один канал
+
+    Retrying --> Collecting: повтор шага
+    Retrying --> Rendering: повтор шага
+    Retrying --> Delivering: повтор шага
+    Retrying --> Failed: попытки исчерпаны
+    Retrying --> Cancelled: отмена
+
+    Delivered --> [*]
+    PartiallyDelivered --> [*]
+    Failed --> [*]
+    Cancelled --> [*]
+```
+
+**Что показывают стрелки.** Стрелка — разрешённый переход, подпись — событие, которое его вызывает.
+Перехода, которого нет на схеме, не существует: `Job` его отклоняет.
+
+**Кто инициирует переходы.**
+
+| Инициатор | Переходы |
+|---|---|
+| Dispatcher (воркер) | Все переходы между шагами, в `Retrying`, `Failed`, `Delivered`, `PartiallyDelivered` |
+| Пользователь через API | `→ Cancelled` (`POST /jobs/{jobId}/cancel`), `AwaitingApproval → Delivering` (`approve`), `AwaitingApproval → Cancelled` (`reject`) |
+| Таймер | `AwaitingApproval → Cancelled` по истечении срока одобрения; `Retrying → шаг` по backoff |
+
+`Narrating` в первой версии не реализуется: флаг LLM выключен, и Dispatcher всегда идёт `Aggregating → Rendering`.
+Состояние оставлено в схеме, чтобы добавить шаг без изменения контракта.
+
+### Запрещённые переходы
+
+Каждая попытка запрещённого перехода пишется в `job_events` с типом `transition_rejected` (откуда, куда, кто просил),
+состояние Job при этом **не меняется**.
+
+| Попытка | Почему запрещено | Что ответит система |
+|---|---|---|
+| Любой переход из `Delivered`, `PartiallyDelivered`, `Failed`, `Cancelled` | Финальные состояния неизменны; повторный запуск — новый Job | API: `409 invalid_transition`, в `details` — `currentState` и `allowedActions: []`. Для повтора — `POST /reports/{reportId}/jobs` |
+| Отмена из `Aggregating`, `Rendering` | Шаги локальные и короткие (секунды); отмена дождётся следующего состояния, где она разрешена | API: `409 invalid_transition`, `details.allowedActions: []`; клиент повторяет отмену позже |
+| Отмена из `Delivering` | Часть каналов могла уже получить отчёт, письмо отозвать нельзя | API: `409 invalid_transition` |
+| `approve` / `reject` не из `AwaitingApproval` | Одобрять нечего: отчёт ещё не собран или уже ушёл | API: `409 invalid_transition` |
+| `Rendering → Delivering` при включённом одобрении | Отчёт не должен уйти без подтверждения владельца (SC-2) | Dispatcher получает `InvalidTransitionException`, шаг завершается без доставки |
+| Пропуск шагов: `Scheduled → Rendering`, `Collecting → Delivering`, `Aggregating → Delivering` и т. п. | Каждый шаг использует результат предыдущего | Dispatcher: `InvalidTransitionException`, Job остаётся в текущем состоянии, ошибка в лог с `jobId` |
+| `Aggregating → Retrying` | Расчёт — чистая функция от собранных данных: повтор даст ту же ошибку | Ошибка расчёта ведёт только в `Failed` |
+| `Retrying →` шаг, отличный от упавшего (например, упал `Delivering`, повтор в `Collecting`) | Повтор только упавшего шага: уже собранные данные и доставленные каналы не трогаем (SC-6) | Dispatcher: `InvalidTransitionException`; шаг для повтора хранится в Job как `retryStep` |
+| `Retrying → Aggregating`, `Retrying → AwaitingApproval` | Эти шаги не повторяются через `Retrying` | Dispatcher: `InvalidTransitionException` |
+| Переход из устаревшего состояния (второй воркер выполняет тот же шаг) | Hangfire доставляет «хотя бы один раз» — шаг может выполниться дважды | Условный `UPDATE ... WHERE state = @expected AND version = @version` не проходит; шаг завершается без побочных эффектов |
