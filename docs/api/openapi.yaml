@@ -420,7 +420,12 @@ paths:
       tags: [jobs]
       operationId: approveJob
       summary: Одобрить отправку (`AwaitingApproval → Delivering`)
-      description: Только владелец отчёта. Не из `AwaitingApproval` — `409 invalid_transition`.
+      description: |
+        Только владелец отчёта. Не из `AwaitingApproval` — `409 invalid_transition`.
+        
+        Если одновременно истёк срок одобрения, выигрывает переход, записанный первым.
+        Проигравший `approve` получает `409 invalid_transition` с `details.currentState = Cancelled`,
+        а в журнале Job есть переход в `Cancelled` с `details.reason = approval_timeout`.
       responses:
         '200':
           description: Job в состоянии `Delivering`
@@ -601,7 +606,9 @@ components:
       in: header
       required: false
       description: |
-        Ключ идемпотентности, UUID. Сервис хранит ключ 24 часа вместе с хэшем тела и ответом.
+        Ключ идемпотентности, UUID. Ключ уникален в паре «пользователь + операция»: тот же ключ
+        у другого пользователя или в другой операции — это другой ключ.
+        Сервис хранит ключ 24 часа вместе с хэшем тела и ответом.
         Повтор с тем же ключом и тем же телом — прежний ответ с кодом `200` и заголовком `Idempotent-Replayed: true`,
         ничего нового не создаётся. Тот же ключ с другим телом — `422 idempotency_key_mismatch`.
       schema:
