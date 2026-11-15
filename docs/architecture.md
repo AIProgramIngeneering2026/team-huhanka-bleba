@@ -239,7 +239,7 @@ stateDiagram-v2
 
 | Попытка | Почему запрещено | Что ответит система |
 |---|---|---|
-| Любой переход из `Delivered`, `PartiallyDelivered`, `Failed`, `Cancelled` | Финальные состояния неизменны; повторный запуск — новый Job | API: `409 invalid_transition`, в `details` — `currentState` и `allowedActions: []`. Для повтора — `POST /reports/{reportId}/jobs` |
+| Любой переход из `Delivered`, `PartiallyDelivered`, `Failed`, `Cancelled` | Финальные состояния неизменны; повторный запуск — новый Job | API: `409 invalid_transition`, в `details` — `currentState` и `allowedActions: []`. Для повтора — `POST /reports/{reportId}/jobs`. Исключение: повторная отмена уже отменённого Job — `200` с тем же Job, перехода нет |
 | Отмена из `Aggregating`, `Rendering` | Шаги локальные и короткие (секунды); отмена дождётся следующего состояния, где она разрешена | API: `409 invalid_transition`, `details.allowedActions: []`; клиент повторяет отмену позже |
 | Отмена из `Delivering` | Часть каналов могла уже получить отчёт, письмо отозвать нельзя | API: `409 invalid_transition` |
 | `approve` / `reject` не из `AwaitingApproval` | Одобрять нечего: отчёт ещё не собран или уже ушёл | API: `409 invalid_transition` |
