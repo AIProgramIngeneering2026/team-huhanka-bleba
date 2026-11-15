@@ -42,3 +42,6 @@
 - [Требования и сценарии](docs/requirements.md)
 - [Архитектура: контекст, компоненты, состояния Job](docs/architecture.md)
 - [Контракт API (OpenAPI 3)](docs/api/openapi.yaml)
+- [Контракт Tool](docs/tool-contract.md)
+- [ADR](docs/adr/)
+- [Проверка контракта колодой](docs/contract-check.md)
