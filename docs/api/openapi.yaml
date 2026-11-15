@@ -58,6 +58,10 @@ security:
 tags:
   - name: reports
     description: Настройка отчётов и расписаний (SC-1)
+  - name: jobs
+    description: Запуск, отслеживание, отмена и одобрение Job (SC-2, SC-3, SC-5, SC-6)
+  - name: files
+    description: Список и выгрузка готовых отчётов (SC-4)
 
 paths:
   /reports:
@@ -224,6 +228,339 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /reports/{reportId}/jobs:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    post:
+      tags: [jobs]
+      operationId: runReport
+      summary: Ручной запуск отчёта за произвольный период (SC-3)
+      description: |
+        Создаёт Job в состоянии `Scheduled` с `trigger = manual` и ставит его в очередь. Ответ не ждёт выполнения.
+
+        * На пару «отчёт + период» допускается один незавершённый Job. Если он есть — `409 job_already_active`,
+          `details.jobId` и заголовок `Location` указывают на него. Это же правило не даёт расписанию создать дубль.
+        * Повтор с тем же `Idempotency-Key` — `200` с тем же Job (например, если ответ на первый запрос потерялся).
+        * Завершённый Job не перезапускается: новый запуск за тот же период создаёт **новый** Job,
+          прежний Job и его файл остаются в истории.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunReportInput'
+      responses:
+        '202':
+          description: Job создан и поставлен в очередь
+          headers:
+            Location:
+              schema:
+                type: string
+              example: /api/v1/jobs/job_01JD3M2V7K
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '200':
+          description: Повтор с тем же `Idempotency-Key` — прежний Job, новый не создан
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/JobConflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/GrafanaRejected'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs:
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: Список Job, доступных пользователю
+      description: Новые сверху. Подходит, чтобы найти Job, если ответ на запуск потерялся и ключа идемпотентности не было.
+      parameters:
+        - name: reportId
+          in: query
+          schema:
+            $ref: '#/components/schemas/ReportId'
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobState'
+        - name: periodFrom
+          in: query
+          description: Только Job, у которых `period.from` равен этому значению
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobPage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{jobId}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [jobs]
+      operationId: getJob
+      summary: Состояние Job
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{jobId}/events:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [jobs]
+      operationId: listJobEvents
+      summary: Журнал переходов Job (`job_events`)
+      description: Старые сверху. Включает отклонённые переходы, попытки, статусы каналов доставки.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница событий
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobEventPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{jobId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [jobs]
+      operationId: cancelJob
+      summary: Отменить Job
+      description: |
+        Разрешено из `Scheduled`, `Collecting`, `Narrating`, `Retrying`, `AwaitingApproval`.
+        Текущий шаг получает сигнал отмены и прерывается; собранные данные и PDF удаляются,
+        в каналы ничего не отправляется.
+
+        Повторная отмена уже отменённого Job — `200` с тем же Job, перехода нет.
+        Из остальных состояний — `409 invalid_transition`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '200':
+          description: Job в состоянии `Cancelled`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/JobConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{jobId}/approve:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [jobs]
+      operationId: approveJob
+      summary: Одобрить отправку (`AwaitingApproval → Delivering`)
+      description: Только владелец отчёта. Не из `AwaitingApproval` — `409 invalid_transition`.
+      responses:
+        '200':
+          description: Job в состоянии `Delivering`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/JobConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{jobId}/reject:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [jobs]
+      operationId: rejectJob
+      summary: Отклонить отправку (`AwaitingApproval → Cancelled`)
+      description: Только владелец отчёта. Не из `AwaitingApproval` — `409 invalid_transition`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '200':
+          description: Job в состоянии `Cancelled`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/JobConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /reports/{reportId}/files:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      tags: [files]
+      operationId: listReportFiles
+      summary: Список файлов отчёта за период (SC-4)
+      description: Нет права чтения отчёта или отчёта нет — `403 forbidden`.
+      parameters:
+        - name: from
+          in: query
+          description: Файлы, у которых `period.from >= from`
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: Файлы, у которых `period.to <= to`
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница метаданных файлов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportFilePage'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /reports/{reportId}/files/{fileId}:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+      - name: fileId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/FileId'
+    get:
+      tags: [files]
+      operationId: downloadReportFile
+      summary: Выгрузить файл отчёта
+      description: |
+        `mode=stream` — файл потоком; `mode=url` — presigned URL MinIO со сроком не больше настроенного (по умолчанию 15 минут).
+
+        * Нет права чтения отчёта — `403 forbidden`, существует ли файл, не раскрывается.
+        * Право есть, файла нет — `404 not_found`.
+        * Файл удалён из MinIO lifecycle-политикой — `410 file_gone`, запись в `report_files` помечается удалённой.
+      parameters:
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [stream, url]
+            default: stream
+      responses:
+        '200':
+          description: Файл или ссылка на него
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignedUrl'
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/FileGone'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
   securitySchemes:
     basicAuth:
@@ -237,6 +574,12 @@ components:
       required: true
       schema:
         $ref: '#/components/schemas/ReportId'
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/JobId'
     Limit:
       name: limit
       in: query
@@ -367,6 +710,58 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    JobConflict:
+      description: |
+        Действие противоречит состоянию Job. Коды:
+        * `job_already_active` — на эту пару «отчёт + период» уже есть незавершённый Job;
+          `details.jobId`, `details.state`, заголовок `Location` — ссылка на него;
+        * `invalid_transition` — переход из текущего состояния запрещён;
+          `details.currentState`, `details.requestedAction`, `details.allowedActions`.
+      headers:
+        Location:
+          schema:
+            type: string
+          description: Только для `job_already_active`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            alreadyActive:
+              value:
+                error:
+                  code: job_already_active
+                  message: A job for this report and period is already running
+                  details:
+                    jobId: job_01JD3M2V7K
+                    state: Collecting
+                  traceId: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            invalidTransition:
+              value:
+                error:
+                  code: invalid_transition
+                  message: Job in state Delivering cannot be cancelled
+                  details:
+                    currentState: Delivering
+                    requestedAction: cancel
+                    allowedActions: []
+                  traceId: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+    FileGone:
+      description: Файл удалён из MinIO по lifecycle-политике. Код `file_gone`, `details.deletedAt`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    StorageUnavailable:
+      description: MinIO не ответил. Код `storage_unavailable`, запрос можно повторить после `Retry-After`.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     InternalError:
       description: Непредвиденная ошибка сервиса. Код `internal_error`; подробности — в логах по `traceId`.
       content:
@@ -418,7 +813,11 @@ components:
         - idempotency_key_mismatch
         - version_conflict
         - report_has_active_jobs
+        - job_already_active
+        - invalid_transition
+        - file_gone
         - grafana_unavailable
+        - storage_unavailable
         - internal_error
 
     FieldError:
@@ -599,3 +998,266 @@ components:
         nextCursor:
           type: string
           nullable: true
+
+    JobId:
+      type: string
+      pattern: '^job_[0-9A-Z]{10,26}$'
+      example: job_01JD3M2V7K
+
+    FileId:
+      type: string
+      pattern: '^file_[0-9A-Z]{10,26}$'
+      example: file_01JD3N4C1A
+
+    Period:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      description: Полуинтервал `[from, to)`
+      properties:
+        from:
+          type: string
+          format: date-time
+          example: '2026-11-02T00:00:00+05:00'
+        to:
+          type: string
+          format: date-time
+          example: '2026-11-09T00:00:00+05:00'
+
+    RunReportInput:
+      type: object
+      additionalProperties: false
+      required: [period]
+      description: |
+        Проверки периода, нарушение — `400 validation_failed`:
+        * `period.to` позже `period.from` — иначе `invalid_value` для `period.to`;
+        * `period.to` не позже текущего времени — иначе `out_of_range` для `period.to`;
+        * длина периода не больше 366 дней — иначе `out_of_range` для `period`.
+      properties:
+        period:
+          $ref: '#/components/schemas/Period'
+
+    ReasonInput:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+
+    JobState:
+      type: string
+      enum:
+        - Scheduled
+        - Collecting
+        - Aggregating
+        - Narrating
+        - Rendering
+        - AwaitingApproval
+        - Delivering
+        - Retrying
+        - Delivered
+        - PartiallyDelivered
+        - Failed
+        - Cancelled
+
+    JobAction:
+      type: string
+      enum: [cancel, approve, reject]
+
+    ChannelStatus:
+      type: object
+      required: [channel, status, attempts]
+      properties:
+        channel:
+          type: string
+          enum: [email, minio]
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+        attempts:
+          type: integer
+          minimum: 0
+        lastError:
+          type: string
+          nullable: true
+
+    JobError:
+      type: object
+      required: [code, message, step]
+      description: Последняя ошибка шага; коды — из контракта Tool (`docs/tool-contract.md`)
+      properties:
+        code:
+          type: string
+          example: upstream_unavailable
+        message:
+          type: string
+        step:
+          type: string
+          example: grafana.collect
+
+    Job:
+      type: object
+      required: [id, reportId, trigger, period, state, attempt, maxAttempts, channels, allowedActions, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: '#/components/schemas/JobId'
+        reportId:
+          $ref: '#/components/schemas/ReportId'
+        trigger:
+          type: string
+          enum: [scheduled, manual]
+        period:
+          $ref: '#/components/schemas/Period'
+        state:
+          $ref: '#/components/schemas/JobState'
+        retryStep:
+          type: string
+          nullable: true
+          description: Шаг, который будет повторён; только в `Retrying`
+          enum: [Collecting, Rendering, Delivering, null]
+        attempt:
+          type: integer
+          minimum: 0
+          description: Номер попытки текущего шага
+        maxAttempts:
+          type: integer
+          minimum: 1
+        nextAttemptAt:
+          type: string
+          format: date-time
+          nullable: true
+        approvalDeadline:
+          type: string
+          format: date-time
+          nullable: true
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChannelStatus'
+        fileId:
+          allOf:
+            - $ref: '#/components/schemas/FileId'
+          nullable: true
+        error:
+          allOf:
+            - $ref: '#/components/schemas/JobError'
+          nullable: true
+        allowedActions:
+          type: array
+          description: Что пользователь может сделать с Job сейчас
+          items:
+            $ref: '#/components/schemas/JobAction'
+        createdBy:
+          type: string
+          nullable: true
+          description: Пользователь для ручного запуска, `null` для планового
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    JobPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Job'
+        nextCursor:
+          type: string
+          nullable: true
+
+    JobEvent:
+      type: object
+      required: [id, jobId, at, type, actor]
+      properties:
+        id:
+          type: integer
+        jobId:
+          $ref: '#/components/schemas/JobId'
+        at:
+          type: string
+          format: date-time
+        type:
+          type: string
+          enum:
+            - transition
+            - transition_rejected
+            - attempt_failed
+            - channel_delivered
+            - channel_failed
+        from:
+          allOf:
+            - $ref: '#/components/schemas/JobState'
+          nullable: true
+        to:
+          allOf:
+            - $ref: '#/components/schemas/JobState'
+          nullable: true
+        actor:
+          type: string
+          description: '`system`, `scheduler` или `user:<login>`'
+          example: user:kuchin
+        details:
+          type: object
+          additionalProperties: true
+
+    JobEventPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobEvent'
+        nextCursor:
+          type: string
+          nullable: true
+
+    ReportFile:
+      type: object
+      required: [id, reportId, jobId, period, sizeBytes, createdAt, deleted]
+      properties:
+        id:
+          $ref: '#/components/schemas/FileId'
+        reportId:
+          $ref: '#/components/schemas/ReportId'
+        jobId:
+          $ref: '#/components/schemas/JobId'
+        period:
+          $ref: '#/components/schemas/Period'
+        sizeBytes:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+          description: '`true`, если объект удалён из MinIO lifecycle-политикой'
+
+    ReportFilePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportFile'
+        nextCursor:
+          type: string
+          nullable: true
+
+    PresignedUrl:
+      type: object
+      required: [url, expiresAt]
+      properties:
+        url:
+          type: string
+          format: uri
+        expiresAt:
+          type: string
+          format: date-time
